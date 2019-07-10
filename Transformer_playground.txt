@@ -1,0 +1,974 @@
+
+# -*- coding: utf-8 -*-
+
+from __future__ import unicode_literals, print_function
+
+from io import open
+import spacy
+import torch
+import numpy as np
+
+import math
+import random
+import logging
+import hashlib
+from collections import defaultdict
+import yaml
+import time
+
+from copy import deepcopy
+
+# bidict
+!pip install bidict
+from bidict import bidict
+
+# namedtensor
+!pip install -qq git+https://github.com/harvardnlp/namedtensor
+from namedtensor import ntorch
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device = {device}")
+
+!wget 'http://opus.nlpl.eu/download.php?f=GlobalVoices/v2017q3/moses/en-sw.txt.zip' -O swahili_data.zip
+!unzip -qo swahili_data.zip
+!wc -l GlobalVoices.en-sw.en
+
+#!wget 'http://www.statmt.org/europarl/v7/fr-en.tgz' -O fr_en.tgz
+#!tar xvzf fr_en.tgz
+#!wc -l europarl-v7.fr-en.fr
+
+def load_yaml(path):
+    with open(path, "r", encoding="utf-8") as fin:
+        return yaml.safe_load(fin)
+      
+def save_yaml(path, obj):
+    with open(path, "w", encoding="utf-8") as fout:
+        fout.write(yaml.dump(obj, allow_unicode=True, default_flow_style=False))
+
+def hash_to_int(obj):
+    s = str(obj).encode('utf-8')
+    h = hashlib.md5(s).hexdigest()
+    return int(h, 16)
+
+unsharded_fr_en_dataset = '''
+metadata: 
+    name: Europarl English-French
+    url: http://www.statmt.org/europarl/v7/fr-en.tgz
+    downloaded_on: 2019-06-22
+format: multiple_file_txt
+data:
+    en:
+        lang: eng
+        path: europarl-v7.fr-en.en
+    fr:
+        lang: fra
+        path: europarl-v7.fr-en.fr
+'''
+
+unsharded_sw_en_dataset = '''
+metadata: 
+    name: GlobalVoices Swahili-English
+    url: http://opus.nlpl.eu/download.php?f=GlobalVoices/v2017q3/moses/en-sw.txt.zip
+    downloaded_on: 2019-06-22
+    desc: The GlobalVoices Swahili-English news corpus, as processed by the OPUS project.
+format: multiple_file_txt
+data:
+    en:
+        lang: eng
+        path: GlobalVoices.en-sw.en
+    sw:
+        lang: swh
+        path: GlobalVoices.en-sw.sw
+'''
+
+
+def make_shards(dataset, num_shards=10):
+  
+    #logging.debug(f"Splitting {paths.values()} into {num_shards} shards")
+    
+    ids = list(dataset["data"])   # just get the keys
+    ids.sort()       # Since Python doesn't hash dictionary keys things the same
+                     # way each time, this would lead to different sentence
+                     # tuples, and then when we hash *those*, we would get 
+                     # different results and then different shards.  So for
+                     # reproducability, we sort the keys alphabetically first.
+                                  
+    sentences_per_id = {}
+    for id in dataset["data"]:
+        path = dataset["data"][id]["path"]
+        with open(path, "r", encoding="utf-8") as fin:
+            sentences_per_id[id] = fin.readlines()
+    
+    sentences = [ sentences_per_id[id] for id in ids ]     # keep these in the same order
+    
+    # make sure input files have same number of sentences
+    num_sentences = -1
+    for ss in sentences:
+      if num_sentences != -1 and len(ss) != num_sentences:
+        logging.warning("Parallel source files have different number of "
+                f"sentences in dataset {dataset['metadata']['name']}")
+    
+    shards = { i:defaultdict(list) for i in range(num_shards) }
+    
+    for sentence_tuple in zip(*sentences):
+        h = hash_to_int(sentence_tuple) % num_shards
+        for id, s in zip(ids, sentence_tuple):
+            shards[h][id].append(s)
+
+    for h in range(num_shards):
+        new_dataset = deepcopy(dataset)
+        new_dataset["metadata"]["sharded"] = True
+        new_dataset["metadata"]["shard"] = h
+        new_dataset["metadata"]["num_shards"] = num_shards
+        for id in ids:
+            filename = f"shard{h}.{id}.txt"
+            new_dataset["data"][id]["path"] = filename
+            lines = shards[h][id]
+            with open(filename, "w", encoding="utf-8") as fout:
+                fout.write("".join(lines))
+        filename = f"shard{h}.yaml"
+        save_yaml(filename, new_dataset)
+
+
+dataset = yaml.load(unsharded_sw_en_dataset)
+make_shards(dataset)
+
+!ls
+!head -n 1 shard8.sw.txt
+!head -n 1 shard8.en.txt
+!cat shard8.yaml
+
+
+
+class DataIterator:
+  
+    def __init__(self, inner_iter=None, make_cache=True, deterministic=True):
+        self.inner_iter = inner_iter
+        if not deterministic:
+            self.deterministic = False
+        elif inner_iter is None:
+            self.deterministic = True
+        else:
+            self.deterministic = inner_iter.deterministic
+        self.itr = None
+        self.make_cache = make_cache
+        self.cache = []
+    
+      
+    def __iter__(self):
+        if self.deterministic and self.cache:
+            return iter(self.cache)
+        self.itr = self.go()
+        return self
+      
+    def __next__(self):
+        result = next(self.itr)
+        if self.deterministic:
+            self.cache.append(result)
+        return result
+        
+        
+
+class SplitIterator(DataIterator):
+    ''' iterates through a split, according to an
+        experiment spec '''
+  
+    def __init__(self, experiment_spec, split_name):
+        super(SplitIterator, self).__init__(None, True)
+        self.experiment_spec = experiment_spec
+        self.split_name = split_name
+    
+    def go(self):
+        for filename in self.experiment_spec[self.split_name]:
+            dataset = load_yaml(filename)
+            ids = list(dataset["data"])
+
+
+            sentences = [] 
+            for id in ids:
+                file_path = dataset["data"][id]["path"]
+                with open(file_path, "r", encoding="utf-8") as fin:
+                    sentences.append([s.rstrip("\n") for s in fin.readlines()])
+
+            num_sentences = -1
+            for ss in sentences:
+                if num_sentences != -1 and len(ss) != num_sentences:
+                    logging.warning("Parallel source files have different "
+                                f"number of sentences: {paths_dict.values()}")
+
+            for ss in zip(*sentences):
+                yield dict(zip(ids, ss))
+
+class TokenizingIterator(DataIterator):
+  
+    def __init__(self, inner_iter):
+        super(TokenizingIterator, self).__init__(inner_iter, True)
+        self.basic_tokenizer = spacy.load('en').tokenizer
+
+    def tokenize(self, sentence):
+        return [token.text for token in self.basic_tokenizer(sentence)]
+      
+    def go(self):
+        for entry in iter(self.inner_iter):
+            yield { id : self.tokenize(s) for id, s in entry.items() } 
+    
+class LowercasingIterator(DataIterator):
+  
+    def __init__(self, inner_iter):
+        super(LowercasingIterator, self).__init__(inner_iter, True)
+        
+    def go(self):
+        for entry in iter(self.inner_iter):
+            yield { id : s.lower() for id, s in entry.items() } 
+    
+class StartEndIterator(DataIterator):
+  
+    def __init__(self, inner_iter, vocab):
+        super(StartEndIterator, self).__init__(inner_iter, True)
+        self.sos = vocab.SOS_TOKEN
+        self.eos = vocab.EOS_TOKEN
+  
+    def go(self):
+        for entry in iter(self.inner_iter):
+            yield { id : [self.sos] + s + [self.eos]
+                                    for id, s in entry.items() }
+  
+  
+class IndexingIterator(DataIterator):
+  
+    def __init__(self, inner_iter, vocab, max_vocab=60000):
+        super(IndexingIterator, self).__init__(inner_iter, True)
+        self.vocab = vocab
+        self.max_vocab = max_vocab
+  
+      
+    def go(self):
+        for entry in iter(self.inner_iter):
+            result = defaultdict(list)
+            for id, tokens in entry.items():
+                for token in tokens:
+                    index = self.vocab.stoi(token)
+                    result[id].append(index)
+            yield result
+
+class NonBucketingIterator(DataIterator):
+  
+    def __init__(self, inner_iter, tokens_per_bucket=1000, bucket_size_iter=5):
+        super(NonBucketingIterator, self).__init__(inner_iter, True)
+        
+    def go(self):
+        for entry in iter(self.inner_iter):
+            result = {}
+            for id, indices in entry.items():
+                result[id] = ntorch.tensor([indices], names=('batch','tokens'))
+            yield result
+
+class BucketingIterator(DataIterator):
+  
+    def __init__(self, inner_iter, tokens_per_bucket=3000, bucket_size_iter=5):
+        super(BucketingIterator, self).__init__(inner_iter, True)
+        self.tokens_per_bucket = tokens_per_bucket
+        self.bucket_size_iter = 5
+        
+
+    def go(self):
+        #if shuffle:
+        #  inner_iter = list(inner_iter)  # collect all sentences
+        #  random.shuffle(inner_iter)
+
+        buckets = {}  # buckets contain torch.Tensors of various sizes.  When one is ready we
+                      # send it down the line and empty it out.
+        vacancies = {}  # how many remaining sentences can fit in each bucket
+        for entry in iter(self.inner_iter):
+            # find whichever sentence is longest; that determines our bucket size
+            length = self.bucket_size_iter  # no point starting smaller than the smallest bucket
+            for id, indices in entry.items():
+                length = max(length, len(indices))
+            length = math.ceil(length / self.bucket_size_iter) \
+                                            * self.bucket_size_iter
+
+            # make the bucket if it doesn't exist
+            if length not in buckets:
+                buckets[length] = defaultdict(list)
+                vacancies[length] = math.floor(self.tokens_per_bucket / length)
+
+            for id, indices in entry.items():
+                len_indices = len(indices)
+                padded_indices = indices + [0] * (length - len(indices))
+                assert(len(padded_indices) == length)
+                buckets[length][id].append(padded_indices)
+
+            vacancies[length] -= 1
+
+            if vacancies[length] <= 0:
+                result = {}
+                for id, sentences in buckets[length].items():
+                    result[id] = ntorch.tensor(sentences, names=('batch','tokens'))
+                del buckets[length]
+                yield result
+
+        # once we've run out of sentences, yield any remaining buckets
+        for length, bucket in list(buckets.items()):
+            result = {}
+            for id, sentences in bucket.items():
+              result[id] = ntorch.tensor(sentences, names=('batch', 'tokens'))
+            del buckets[length]
+            yield result
+
+            
+class Vocab:
+   
+    def __init__(self, max_vocab=60000):
+      
+        self.PAD_TOKEN = "<pad>"
+        self.PAD_INDEX = 0
+        self.UNK_TOKEN = "<unk>"
+        self.UNK_INDEX = 1
+        self.SOS_TOKEN = "<sos>"
+        self.SOS_INDEX = 2
+        self.EOS_TOKEN = "<eos>"
+        self.EOS_INDEX = 3
+        self.vocab = bidict({ self.PAD_TOKEN: self.PAD_INDEX, 
+                              self.UNK_TOKEN: self.UNK_INDEX, 
+                              self.SOS_TOKEN: self.SOS_INDEX, 
+                              self.EOS_TOKEN: self.EOS_INDEX })
+        self.max_vocab = max_vocab
+        self.is_frozen = False
+        
+    def __len__(self):
+        return len(self.vocab)
+      
+    def freeze(self):
+        self.is_frozen = True
+        
+    def stoi(self, s):
+      
+        if s not in self.vocab:
+            if len(self.vocab) < self.max_vocab and not self.is_frozen:
+                index = len(self.vocab)
+                self.vocab[s] = index
+                return index
+            return self.vocab[self.UNK_TOKEN]
+          
+        return self.vocab[s]
+      
+    def itos(self, i):
+        if i not in self.vocab.inverse:
+            return self.UNK_TOKEN
+        return self.vocab.inverse[i]
+    
+    
+def setup_data_iterators(experiment_spec, vocab, max_vocab=60000):
+  
+    
+    splits = { 
+        "train": SplitIterator(experiment_spec, "train"),
+        "dev": SplitIterator(experiment_spec, "dev"),
+        "test": SplitIterator(experiment_spec, "test")
+    }
+    
+    for split_name in splits:
+        itr = splits[split_name]
+        
+        itr = LowercasingIterator(itr)
+        itr = TokenizingIterator(itr)
+        itr = StartEndIterator(itr, vocab)
+        itr = IndexingIterator(itr, vocab, max_vocab)
+        
+        if split_name == "train":      
+            itr = BucketingIterator(itr)
+        else:
+            itr = NonBucketingIterator(itr)
+            
+        splits[split_name] = itr
+        
+    for i, e in enumerate(iter(splits["train"])):
+        pass # run it once through train to learn the vocabulary
+    
+    vocab.freeze()
+    
+    return splits["train"], splits["dev"], splits["test"]
+   
+        
+        
+
+
+
+class Embedder(ntorch.nn.Module):
+  
+    def __init__(self, vocab_size, model_size=512):
+        super().__init__()
+        self.embed = ntorch.nn.Embedding(vocab_size, model_size)
+        
+    def forward(self, x):
+        return self.embed(x)
+      
+
+
+class PositionEmbedder(ntorch.nn.Module):
+    
+    def __init__(self, model_size=512, max_seq_len = 200):
+        super().__init__()
+        self.model_size = model_size
+        
+        model_size_half = math.floor(float(model_size) / 2)
+        model_size_half2 = math.ceil(float(model_size) / 2)
+        
+        # gotta do this all in vanilla pytorch because
+        # one of the versions of torch.pow isn't yet
+        # implemented in namedtensor
+        
+        i = torch.arange(model_size_half, requires_grad=False)
+        i = i.unsqueeze(0).expand(max_seq_len, model_size_half).float()
+        
+        i2 = torch.arange(model_size_half2, requires_grad=False)
+        i2 = i2.unsqueeze(0).expand(max_seq_len, model_size_half2).float()
+        
+        pos = torch.arange(max_seq_len, requires_grad=False)
+        pos = pos.unsqueeze(1).float()    
+        pe1 = torch.sin(pos / torch.pow(10000.0, i / model_size))
+        pe2 = torch.cos(pos / torch.pow(10000.0, i2 / model_size))
+        pe = torch.cat((pe1, pe2), dim=1)
+        self.pe = ntorch.tensor(pe, names=("tokens", "embedding")).to(device)
+               
+
+    def forward(self, x):
+        x = x * math.sqrt(self.model_size)
+        narrowed_pe = self.pe.narrow("tokens", 0, x.size("tokens"))
+        x = x + narrowed_pe
+        return x
+      
+
+#plt.imshow(pe.pe.cpu().numpy())
+
+
+
+
+def make_source_mask(source_batch, vocab):
+  
+    source_mask = (source_batch != vocab.PAD_INDEX).float().to(device)
+    source_mask = source_mask.rename("tokens", "tokens2")
+    return source_mask
+  
+def make_target_mask(target_batch, vocab):
+
+    target_mask = (target_batch != vocab.PAD_INDEX).float()
+    size = target_batch.size("tokens")
+    nopeak_mask = np.triu(np.ones((1, size, size)), k=1)
+    nopeak_mask = ntorch.tensor(nopeak_mask == 0, 
+                       names=("batch", "tokens", "tokens2")).float().to(device)
+    
+    target_mask = target_mask * nopeak_mask
+    return target_mask
+
+
+
+
+
+class MultiHeadAttention(ntorch.nn.Module):
+  
+    def __init__(self, num_heads=8, model_size=512, dropout_rate = 0.1):
+        super().__init__()
+        
+        self.model_size = model_size
+        assert(model_size % num_heads == 0)
+        self.d_key = model_size // num_heads
+        self.num_heads = num_heads
+        
+        self.query_linear = ntorch.nn.Linear(model_size, model_size).spec("embedding")
+        self.value_linear = ntorch.nn.Linear(model_size, model_size).spec("embedding")
+        self.key_linear = ntorch.nn.Linear(model_size, model_size).spec("embedding")
+        self.dropout = ntorch.nn.Dropout(dropout_rate)
+        self.out_linear = ntorch.nn.Linear(model_size, model_size).spec("embedding")
+        
+      
+    def forward(self, query, key, value, mask=None):
+        
+        # make keys/queries/values (for all "heads" at once)
+        key = self.key_linear(key)
+        query = self.query_linear(query)
+        value = self.value_linear(value)
+        
+        # then actually split them into separate heads
+        key = key.split("embedding", ("heads", "embedding"), heads=self.num_heads).rename("tokens", "tokens2")
+        query = query.split("embedding", ("heads", "embedding"), heads=self.num_heads)
+        value = value.split("embedding", ("heads", "embedding"), heads=self.num_heads).rename("tokens", "tokens2")
+        
+        # attention
+        scores = ntorch.dot("embedding", query, key) /  math.sqrt(self.d_key)   # compare the embeddings for each pair of tokens
+        scores = scores * mask                                                  # mask out scores you shouldn't know
+        scores = scores.softmax("tokens2")                               
+        scores = self.dropout(scores)                                  
+        output = ntorch.dot("tokens2", scores, value)                            # calculate the new token embeddings
+      
+        # put the heads back together
+        output = output.stack(("heads", "embedding"), "embedding")
+        output = self.out_linear(output)
+        return output
+
+
+e = torch.randn(10, 80, 8*64)
+
+query = torch.randn(10, 8, 80, 64)
+key = torch.randn(10, 8, 80, 64)
+value = torch.randn(10, 8, 80, 64)
+
+
+
+def attention(q, k, v, d_k, mask=None, dropout=None):
+    
+  scores = torch.matmul(q, k.transpose(-2, -1)) /  math.sqrt(d_k)
+
+  if mask is not None:
+    mask = mask.unsqueeze(1)
+    scores = scores.masked_fill(mask == 0, -1e9)
+  scores = torch.nn.functional.softmax(scores, dim=-1)
+  print(scores.shape)
+  
+  if dropout is not None:
+    scores = dropout(scores)
+        
+  output = torch.matmul(scores, v)
+  return output
+
+x = attention(query, key, value, 64)
+print(x.shape)
+
+
+
+
+class LayerNorm(ntorch.nn.Module):
+    def __init__(self, model_size=512, eps = 1e-6):
+        super().__init__()
+    
+        self.model_size = model_size
+        # create two learnable parameters to calibrate normalisation
+        alpha = ntorch.ones(model_size, names=("embedding"))
+        bias = ntorch.zeros(model_size, names=("embedding"))
+        
+        self.register_parameter("alpha", alpha)
+        self.register_parameter("bias", bias)
+        
+        self.eps = eps
+        
+        #if torch.cuda.is_available():
+        #    self.alpha = self.alpha.cuda()
+        #    self.bias = self.bias.cuda()
+        
+        #self.register_parameter("alpha", self.alpha)
+        #self.register_parameter("bias", self.bias)
+        
+    def forward(self, x):
+        norm = self.alpha * (x - x.mean("embedding")) 
+        norm = norm / (x.std("embedding") + self.eps) 
+        norm = norm + self.bias
+        return norm
+
+
+class SelfAttentionLayer(ntorch.nn.Module):
+  
+    def __init__(self, model_size=512, num_heads=8, dropout_rate=0.1):
+        super().__init__()
+        self.norm = LayerNorm(model_size)
+        self.attn = MultiHeadAttention(num_heads, model_size)
+        self.dropout = ntorch.nn.Dropout(dropout_rate)
+        
+    def forward(self, x, mask):
+        x_norm = self.norm(x)
+        x_attn = self.attn(x_norm, x_norm, x_norm, mask)
+        x = x + self.dropout(x_attn)
+        return x
+      
+class OtherAttentionLayer(ntorch.nn.Module):
+  
+    def __init__(self, model_size=512, num_heads=8, dropout_rate=0.1):
+        super().__init__()
+        self.norm = LayerNorm(model_size)
+        self.attn = MultiHeadAttention(num_heads, model_size)
+        self.dropout = ntorch.nn.Dropout(dropout_rate)
+        
+    def forward(self, x, other_x, mask):
+        x_norm = self.norm(x)
+        x_attn = self.attn(x_norm, other_x, other_x, mask)
+        x = x + self.dropout(x_attn)
+        return x
+      
+class FeedForward(ntorch.nn.Module):
+  
+    def __init__(self, model_size=512, hidden_size=512, dropout_rate=0.1):
+        super().__init__() 
+        self.norm = LayerNorm(model_size)
+        self.linear1 = ntorch.nn.Linear(model_size, hidden_size)
+        self.dropout1 = ntorch.nn.Dropout(dropout_rate)
+        self.linear2 = ntorch.nn.Linear(hidden_size, model_size)
+        self.dropout2 = ntorch.nn.Dropout(dropout_rate)
+        
+    def forward(self, x):
+      
+        x_norm = self.norm(x)
+        x_norm = self.linear1(x_norm)
+        x_norm = ntorch.relu(x_norm)
+        x_norm = self.dropout1(x_norm)
+        x_norm = self.linear2(x_norm)
+        x = x + self.dropout2(x_norm)
+        return x      
+      
+class DecoderLayer(ntorch.nn.Module):
+  
+    def __init__(self, model_size=512, num_heads=8, dropout_rate=0.1):
+        super().__init__()
+        
+        self.self_attn = SelfAttentionLayer(model_size, num_heads, dropout_rate)
+        self.other_attn = OtherAttentionLayer(model_size, num_heads, dropout_rate)
+        #self.norm1 = LayerNorm(model_size)
+        #self.norm2 = LayerNorm(model_size)
+        #self.norm3 = LayerNorm(model_size)
+        
+        #self.dropout1 = ntorch.nn.Dropout(dropout_rate)
+        #self.dropout2 = ntorch.nn.Dropout(dropout_rate)
+        #self.dropout3 = ntorch.nn.Dropout(dropout_rate)
+        
+        #self.attn1 = MultiHeadAttention(num_heads, model_size)
+        #self.attn2 = MultiHeadAttention(num_heads, model_size)
+        
+        self.ff = FeedForward(model_size, model_size, dropout_rate)
+        
+    def forward(self, x, e_outputs, src_mask, trg_mask):
+        
+        x = self.self_attn(x, trg_mask)
+        x = self.other_attn(x, e_outputs, src_mask)
+        x = self.ff(x)
+        
+        #x_norm = self.norm1(x)
+        #x_attn = self.attn1(x_norm, x_norm, x_norm, trg_mask)
+        #x = x + self.dropout1(x_attn)
+        
+        #x_norm = self.norm2(x)
+        #x_attn = self.attn2(x_norm, e_outputs, e_outputs, src_mask)
+        #x = x + self.dropout2(x_attn)
+        
+        #x_norm = self.norm3(x)
+        #x_ff = self.ff(x_norm)
+        #x = x + self.dropout3(x_ff)
+        
+        return x
+
+
+class EncoderLayer(ntorch.nn.Module):
+    
+    def __init__(self, model_size=512, num_heads=8, dropout_rate=0.1):
+      
+        super().__init__()
+        
+        self.self_attn = SelfAttentionLayer(model_size, num_heads, dropout_rate)
+        
+        #self.norm_1 = LayerNorm(model_size)
+        #self.norm_2 = LayerNorm(model_size)
+        #self.attn = MultiHeadAttention(num_heads, model_size)
+        self.ff = FeedForward(model_size, model_size, dropout_rate)
+        #self.dropout1 = ntorch.nn.Dropout(dropout_rate)
+        #self.dropout2 = ntorch.nn.Dropout(dropout_rate)
+        
+    def forward(self, x, mask):
+        
+        # Block 1: attention
+        #x_norm = self.norm_1(x)
+        #x_attn = self.attn(x_norm,x_norm,x_norm,mask)
+        #x = x + self.dropout1(x_attn)
+        
+        x = self.self_attn(x, mask)
+        x = self.ff(x)
+        
+        # Block 2: feed-forward
+        #x_norm = self.norm_2(x)
+        #x_ff = self.ff(x_norm)
+        #x = x + self.dropout2(x_ff)
+        return x
+      
+
+
+
+class Encoder(ntorch.nn.Module):
+  
+    def __init__(self, vocab_size, model_size=512, num_layers=6, num_heads=8):
+      
+        super().__init__()
+        self.num_layers = num_layers
+        self.embed = Embedder(vocab_size, model_size)
+        self.pe = PositionEmbedder(model_size)
+        self.layers = ntorch.nn.ModuleList([
+              EncoderLayer(model_size, num_heads) 
+                  for l in range(num_layers)])
+        self.norm = LayerNorm(model_size)
+        
+    def forward(self, src, src_mask):
+        x = self.embed(src)
+        x = self.pe(x)
+        for i in range(self.num_layers):
+            x = self.layers[i](x, src_mask)
+        return self.norm(x)
+      
+
+
+class Decoder(ntorch.nn.Module):
+  
+    def __init__(self, vocab_size, model_size=512, num_layers=6, num_heads=8):
+      
+        super().__init__()
+        self.num_layers = num_layers
+        self.embed = Embedder(vocab_size, model_size)
+        self.pe = PositionEmbedder(model_size)
+        self.layers = ntorch.nn.ModuleList([
+              DecoderLayer(model_size, num_heads) 
+                  for l in range(num_layers)])
+        self.norm = LayerNorm(model_size)
+        self.out_linear = ntorch.nn.Linear(model_size, vocab_size) \
+                                   .spec("embedding", name_out="logits")
+        
+    def forward(self, trg, e_outputs, src_mask, trg_mask):
+        x = self.embed(trg)
+        x = self.pe(x)
+        for i in range(self.num_layers):
+            x = self.layers[i](x, e_outputs, src_mask, trg_mask)
+        x = self.norm(x)
+        x = self.out_linear(x)
+        return x
+      
+      
+
+class Transformer(ntorch.nn.Module):
+  
+    def __init__(self, vocab, model_size=512, num_layers=6, num_heads=8):
+        super().__init__()
+        self.vocab = vocab
+        vocab_size = len(vocab)
+        self.encoder = Encoder(vocab_size, model_size, num_layers, num_heads)
+        self.decoder = Decoder(vocab_size, model_size, num_layers, num_heads)
+        
+    def forward(self, src, trg):
+        src_mask = make_source_mask(src, self.vocab)
+        trg_mask = make_target_mask(trg, self.vocab)
+        src_outputs = self.encoder(src, src_mask)
+        #src_mask = src_mask.rename("tokens", "tokens2")
+        trg_output = self.decoder(trg, src_outputs, src_mask, trg_mask)
+        return trg_output
+      
+
+NUM_LAYERS_DEFAULT = 6
+NUM_HEADS_DEFAULT = 8
+MODEL_SIZE_DEFAULT = 512
+LEARNING_RATE_DEFAULT = 0.0001
+ADAM_BETA1_DEFAULT = 0.9
+ADAM_BETA2_DEFAULT = 0.98
+
+class Experiment:
+  
+    def __init__(self, exp_spec):
+        self.exp_spec = exp_spec
+        self.setup_data()
+        self.setup_model()
+            
+    def setup_data(self):
+        self.vocab = Vocab(100000)
+        logging.info("Loading data and making vocab")
+        self.train_iter, self.dev_iter, self.test_iter = \
+            setup_data_iterators(self.exp_spec, self.vocab)
+
+    def setup_model(self):
+        
+        logging.info("Setting up model")
+        
+        if "hyperparams" not in self.exp_spec:
+            logging.error("Experiment specification contains no hyperparameters.")
+            sys.exit()
+
+        hyperparams = self.exp_spec["hyperparams"]        
+        self.num_layers = hyperparams.get("num_layers", NUM_LAYERS_DEFAULT)
+        self.num_heads = hyperparams.get("num_heads", NUM_HEADS_DEFAULT)
+        self.model_size = hyperparams.get("model_size", MODEL_SIZE_DEFAULT)
+        self.learning_rate = hyperparams.get("learning_rate", LEARNING_RATE_DEFAULT)
+        self.adam_beta1 = hyperparams.get("adam_beta1", ADAM_BETA1_DEFAULT)
+        self.adam_beta2 = hyperparams.get("adam_beta2", ADAM_BETA2_DEFAULT)
+            
+                
+        self.model = Transformer(self.vocab, 
+                                 num_layers=self.num_layers,
+                                 num_heads=self.num_heads,
+                                 model_size=self.model_size).to(device)
+
+        for p in self.model.parameters():
+            if p.dim() > 1:
+                torch.nn.init.xavier_uniform_(p)        
+      
+        self.optim = torch.optim.Adam(self.model.parameters(), 
+                                      lr=self.learning_rate, 
+                                      betas=(self.adam_beta1, self.adam_beta2), 
+                                      eps=1e-9)
+        self.loss_function = ntorch.nn.CrossEntropyLoss(
+                    ignore_index=self.vocab.PAD_INDEX)\
+                      .spec("logits").to(device)
+
+
+
+    def train(self, epochs):
+
+        self.model.train()
+
+        start = time.time()
+        temp = start
+
+        total_loss = 0
+
+        for i, epoch in enumerate(range(epochs)):
+
+            for j, batch in enumerate(iter(self.train_iter)):
+                src = batch["sw"].to(device)
+                trg = batch["en"].to(device)
+
+
+                trg_num_tokens = trg.size("tokens")
+                trg_input = trg[{"tokens":slice(0, trg_num_tokens-1)}]
+                trg_targets = trg[{"tokens":slice(1, trg_num_tokens)}]
+
+                preds = self.model(src, trg_input)
+
+                self.optim.zero_grad()
+
+                loss = self.loss_function(preds, trg_targets)
+                loss.backward()
+                self.optim.step()
+                
+                total_loss += float(loss.detach().cpu().numpy())
+
+                if j % 100 == 0:
+                    print(".", end="")
+
+            print()
+            print("time = %dm, epoch %d, loss = %.4f, %ds per epoch" % ((time.time() - start) // 60,
+                        epoch + 1, total_loss, time.time() - temp))
+            total_loss = 0
+            temp = time.time()
+                
+    def translate(self, itr, max_len=120):
+
+        self.model.eval()
+        
+        result_sentences = []
+        
+        for batch_idx, batch in enumerate(iter(itr)):
+          
+            if batch_idx >= 10:
+                break
+                
+            src_batch = batch["sw"].to(device)
+            
+            for src_sent_idx in range(src_batch.size("batch")):
+                src = src_batch[{"batch":src_sent_idx}]
+                src_mask = make_source_mask(src, self.vocab)
+                src_outputs = self.model.encoder(src, src_mask)
+
+                trg_outputs = ntorch.zeros(1, max_len, 
+                                           names=("batch", "tokens"), 
+                                           dtype=torch.long, device=device)
+                trg_outputs[{"tokens":0}] = self.vocab.SOS_INDEX
+
+                sentence = []
+                
+                for i in range(1, max_len):    
+
+                    trg_mask = np.triu(np.ones((1, i, i)), k=1).astype('uint8')
+                    trg_mask = ntorch.tensor(trg_mask == 0, 
+                           names=("batch", "tokens", "tokens2")).float().to(device)
+
+                    outputs_so_far = trg_outputs[{"tokens":slice(0,i)}]
+                    dec_outputs = self.model.decoder(outputs_so_far, 
+                                                     src_outputs,
+                                                     src_mask,
+                                                     trg_mask)
+
+                    logits = dec_outputs.softmax("logits")
+
+                    val, ix = logits[{"batch":0,"tokens":i-1}].topk("logits", 1)
+                    output_token = int(ix[{"logits":0}].cpu().numpy())
+                    #print(output_token)
+                    sentence.append(self.vocab.itos(output_token))
+                    trg_outputs[{"tokens":i}] = output_token
+                    
+                    if output_token in [self.vocab.EOS_INDEX, self.vocab.PAD_INDEX]:
+                        break
+                                
+                result_sentences.append(" ".join(sentence))
+                
+        return result_sentences
+      
+
+
+experiment_sw_en = '''
+metadata:
+    id: sw_en_dev8_test9_3_8_256
+    name: GlobalVoices Swahili-English
+    created_on: 2019-06-23
+hyperparams:
+    num_layers: 2
+    num_heads: 8
+    model_size: 128
+    learning_rate: 0.0001
+    beta1: 0.9
+    beta2: 0.98
+train:
+    - shard0.yaml
+    - shard1.yaml
+    - shard2.yaml
+    - shard3.yaml
+    - shard4.yaml
+    - shard5.yaml
+    - shard6.yaml
+    - shard7.yaml
+dev:
+    - shard8.yaml
+test:
+    - shard9.yaml
+'''
+
+experiment_fr_en = '''
+metadata:
+    id: fr_en_dev8_test9_4_8_256
+    name: Europarl French-English
+    created_on: 2019-06-23
+hyperparams:
+    num_layers: 2
+    num_heads: 8
+    model_size: 128
+    learning_rate: 0.0001
+    beta1: 0.9
+    beta2: 0.98
+train:
+    - shard0.yaml
+    - shard1.yaml
+    - shard2.yaml
+    - shard3.yaml
+    - shard4.yaml
+    - shard5.yaml
+    - shard6.yaml
+    - shard7.yaml
+dev:
+    - shard8.yaml
+test:
+    - shard9.yaml
+'''
+
+exp_spec = yaml.load(experiment_sw_en)
+exp = Experiment(exp_spec)
+
+
+exp.train(60)
+
+result_sentences = exp.translate(exp.dev_iter)
+print(result_sentences[:10])
+
+print("Model's state_dict:")
+num_params = 0
+for p, t in exp.model.state_dict().items():
+    print(p, "\t", t.shape)
+    num_params += np.prod(t.shape)
+print(num_params)
